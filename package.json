@@ -12,5 +12,8 @@
 		"@cloudflare/vitest-pool-workers": "^0.7.5",
 		"vitest": "~3.0.7",
 		"wrangler": "^4.12.0"
+	},
+	"dependencies": {
+		"hono": "^4.7.7"
 	}
 }
