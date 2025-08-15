@@ -5,22 +5,6 @@ import { cors } from 'hono/cors';
 const DEFAULT_TRANSCRIPT_LANGUAGE = 'en';
 const DEFAULT_TRANSCRIPT_KIND = 'asr';
 const CACHE_TTL_SECONDS = 3600; // Cache transcripts for 1 hour
-const MAX_RETRIES = 3;
-const INITIAL_RETRY_DELAY = 1000; // 1 second
-
-// Common user agents for random selection
-const USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:120.0) Gecko/20100101 Firefox/120.0',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/120.0.0.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:119.0) Gecko/20100101 Firefox/119.0'
-];
 
 // Custom Error for specific transcript issues
 class TranscriptError extends Error {
@@ -30,39 +14,6 @@ class TranscriptError extends Error {
         this.status = status; // HTTP status code to return
     }
 }
-
-// Function to get a random user agent
-const getRandomUserAgent = () => {
-    return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-};
-
-// Retry utility function with exponential backoff
-const retryWithBackoff = async (fn, maxRetries = MAX_RETRIES, initialDelay = INITIAL_RETRY_DELAY) => {
-    let lastError;
-
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        try {
-            return await fn();
-        } catch (error) {
-            lastError = error;
-
-            // Don't retry on the last attempt
-            if (attempt === maxRetries) {
-                break;
-            }
-
-            // Calculate delay with exponential backoff (2^attempt * initialDelay)
-            const delay = initialDelay * Math.pow(2, attempt);
-
-            console.warn(`Attempt ${attempt + 1} failed, retrying in ${delay}ms:`, error.message);
-
-            // Wait before retrying
-            await new Promise(resolve => setTimeout(resolve, delay));
-        }
-    }
-
-    throw lastError;
-};
 
 const app = new Hono();
 
@@ -224,62 +175,35 @@ export const getTranscript = async (videoId, langOption) => {
 };
 
 export const getLangOptionsWithLink = async (videoId) => {
-    return await retryWithBackoff(async () => {
-        const userAgent = getRandomUserAgent();
-        const videoPageResponse = await fetch("https://www.youtube.com/watch?v=" + videoId, {
-            headers: {
-                'User-Agent': userAgent,
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Accept-Encoding': 'gzip, deflate',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1'
-            }
-        });
+    const videoPageResponse = await fetch("https://www.youtube.com/watch?v=" + videoId);
+    const videoPageHtml = await videoPageResponse.text();
+    const splittedHtml = videoPageHtml.split('"captions":');
 
-        if (!videoPageResponse.ok) {
-            throw new Error(`Failed to fetch YouTube page: ${videoPageResponse.status} ${videoPageResponse.statusText}`);
-        }
+    if (splittedHtml.length < 2) {
+        return; // No Caption Available
+    }
 
-        const videoPageHtml = await videoPageResponse.text();
-        const splittedHtml = videoPageHtml.split('"captions":');
+    const captions_json = JSON.parse(splittedHtml[1].split(',"videoDetails')[0].replace('\n', ''));
+    const captionTracks = captions_json.playerCaptionsTracklistRenderer.captionTracks;
+    const languageOptions = Array.from(captionTracks).map(i => { return i.name.simpleText; });
 
-        if (splittedHtml.length < 2) {
-            return; // No Caption Available - this shouldn't be retried
-        }
+    const first = "English"; // Sort by English first
+    languageOptions.sort(function (x, y) {
+        return x.includes(first) ? -1 : y.includes(first) ? 1 : 0;
+    });
+    languageOptions.sort(function (x, y) {
+        return x == first ? -1 : y == first ? 1 : 0;
+    });
 
-        let captions_json;
-        try {
-            captions_json = JSON.parse(splittedHtml[1].split(',"videoDetails')[0].replace('\n', ''));
-        } catch (parseError) {
-            throw new Error(`Failed to parse captions JSON: ${parseError.message}`);
-        }
-
-        if (!captions_json.playerCaptionsTracklistRenderer?.captionTracks) {
-            throw new Error('Caption tracks not found in response');
-        }
-
-        const captionTracks = captions_json.playerCaptionsTracklistRenderer.captionTracks;
-        const languageOptions = Array.from(captionTracks).map(i => { return i.name.simpleText; });
-
-        const first = "English"; // Sort by English first
-        languageOptions.sort(function (x, y) {
-            return x.includes(first) ? -1 : y.includes(first) ? 1 : 0;
-        });
-        languageOptions.sort(function (x, y) {
-            return x == first ? -1 : y == first ? 1 : 0;
-        });
-
-        return Array.from(languageOptions).map((langName, index) => {
-            const captionTrack = captionTracks.find(i => i.name.simpleText === langName);
-            const languageCode = captionTrack.languageCode;
-            const kind = captionTrack?.kind || 'manual';
-            return {
-                language: langName,
-                languageCode: languageCode,
-                kind: kind
-            };
-        });
+    return Array.from(languageOptions).map((langName, index) => {
+        const captionTrack = captionTracks.find(i => i.name.simpleText === langName);
+        const languageCode = captionTrack.languageCode;
+        const kind = captionTrack?.kind || 'manual';
+        return {
+            language: langName,
+            languageCode: languageCode,
+            kind: kind
+        };
     });
 };
 
